@@ -17,8 +17,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"strings"
+        "github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml"
 )
 
 // Constants representing different MIG strategies.
@@ -55,28 +58,82 @@ type migStrategyMixed struct{ nvml Nvml }
 
 // migStrategyNone
 func (s *migStrategyNone) GenerateLabels() (map[string]string, error) {
-	count, err := s.nvml.GetDeviceCount()
+
+	labels := make(map[string]string)
+
+	deviceCount, err := s.nvml.GetDeviceCount()
+	if err != nil {
+		return nil, fmt.Errorf("Error getting device count: %v", err)
+	}
+	labels["nvidia.com/gpu.count"] = fmt.Sprintf("%d", deviceCount)
+
+	err = setLabel(s.nvml, labels, "nvidia.com/gpu.product", func(device *nvml.Device) (string, error) {if device.Model == nil {return "", errors.New("Model was null")} else {return strings.Replace(*device.Model, " ", "-", -1), nil}})
+	if err != nil {
+		return nil, err
+	}
+
+	setLabel(s.nvml, labels, "nvidia.com/gpu.memory", func(device *nvml.Device) (string, error) {if device.Memory == nil {return "", errors.New("Memory was null")} else {return fmt.Sprintf("%d", *device.Memory), nil}})
+	if err != nil {
+		return nil, err
+	}
+
+	return labels, nil
+}
+
+func setLabel(nvml Nvml, labels map[string]string, labelName string, getter func(*nvml.Device) (string, error)) error {
+	values, err := getPerDeviceValues(nvml, getter)
+	if (err != nil) {
+		return fmt.Errorf("Error getting value for %s: %v", labelName, err)
+	}
+
+	if (!areIdentical(values)) {
+		log.Printf("Not setting label %s: Expected value to be unique, but got %s", labelName, strings.Join(values, ","))
+		return nil
+	}
+
+	labels[labelName] = values[0]
+	return nil
+}
+
+func getPerDeviceValues(nvml Nvml, getter func(*nvml.Device) (string, error)) ([]string, error) {
+	deviceCount, err := nvml.GetDeviceCount()
 	if err != nil {
 		return nil, fmt.Errorf("Error getting device count: %v", err)
 	}
 
-	device, err := s.nvml.NewDevice(0)
-	if err != nil {
-		return nil, fmt.Errorf("Error getting device: %v", err)
+	if (deviceCount <= 0) {
+		return nil, errors.New("Got no devices")
 	}
 
-	labels := make(map[string]string)
-	labels["nvidia.com/gpu.count"] = fmt.Sprintf("%d", count)
-	if device.Instance().Model != nil {
-		model := strings.Replace(*device.Instance().Model, " ", "-", -1)
-		labels["nvidia.com/gpu.product"] = model
+	result := []string{}
+	for deviceIdx := uint(0); deviceIdx < deviceCount; deviceIdx++ {
+		device, err := nvml.NewDevice(deviceIdx)
+		if err != nil {
+			log.Printf("Error getting device at index %d: %v", deviceIdx, err)
+			continue
+		}
+		val, err := getter(device.Instance())
+		if err != nil {
+			log.Printf("Error getting value for device at index %d: %v", deviceIdx, err)
+			continue
+		}
+		result = append(result, val)
 	}
-	if device.Instance().Memory != nil {
-		memory := *device.Instance().Memory
-		labels["nvidia.com/gpu.memory"] = fmt.Sprintf("%d", memory)
+	if len(result) == 0 {
+		return nil, fmt.Errorf("Failed to read value for all devices, last error was: %v", err)
 	}
+	return result, nil
+}
 
-	return labels, nil
+func areIdentical(strings []string) bool {
+	var last string
+	for i, s := range strings {
+		if i > 0 && last != s {
+			return false
+		}
+		last = s
+	}
+	return true
 }
 
 // migStrategySingle
